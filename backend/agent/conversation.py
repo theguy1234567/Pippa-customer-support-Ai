@@ -23,11 +23,13 @@ def _looks_like_new_problem(message: str) -> bool:
 
 def _is_follow_up(message: str) -> bool:
     text = message.strip().lower()
+    if text.isdigit():
+        return False
     if any(re.search(pattern, text, re.I) for pattern in FOLLOW_UP_PATTERNS):
         return True
     if _looks_like_new_problem(message):
         return bool(REFERENTIAL.search(message))
-    return len(text.split()) <= 7
+    return len(text.split()) <= 7 and bool(REFERENTIAL.search(message))
 
 
 def build_contextual_query(message: str, conversation: Iterable[ConversationTurn] | None = None) -> str:

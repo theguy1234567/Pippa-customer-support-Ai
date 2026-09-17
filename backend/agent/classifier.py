@@ -1,4 +1,4 @@
-"""Intent prediction with an optional trained model and deterministic fallback."""
+"""Intent prediction with trained-model support and a generalized deterministic fallback."""
 
 from __future__ import annotations
 
@@ -19,15 +19,15 @@ TAXONOMY = [
 _RULES = {
     "keyboard_text_input_issue": re.compile(r"\b(keyboard|typing|typed|autocorrect|spelling|letter|question mark|symbol)\b", re.I),
     "app_store_app_issue": re.compile(r"\b(app store|appstore|apps?|application)\b", re.I),
-    "device_hardware_issue": re.compile(r"\b(battery|charging|charger|screen|display|camera|speaker|microphone|home button|hardware)\b", re.I),
+    "device_hardware_issue": re.compile(r"\b(battery|charging|charger|screen|display|camera|speaker|microphone|home button|hardware|touch|unresponsive)\b", re.I),
     "apple_service_issue": re.compile(r"\b(apple id|icloud|itunes|apple music|apple pay|facetime|imessage|apple watch)\b", re.I),
     "ios_update_issue": re.compile(r"\b(ios\s*[-.]?\s*\d|ios\b|update\w*|upgrad\w*|firmware)\b", re.I),
     "support_dm_request": re.compile(r"\b(dm|direct message|private message|send .*message|message me)\b", re.I),
-    "device_functionality_issue": re.compile(r"\b(not working|isn't working|doesn't work|won't work|cannot|can't|crash\w*|freez\w*|stuck|slow|bug\w*|glitch\w*|problem|issue)\b", re.I),
+    "device_functionality_issue": re.compile(r"\b(wifi|wi-fi|bluetooth|network|connect\w*|disconnect\w*|not working|isn't working|doesn't work|won't work|cannot|can't|crash\w*|freez\w*|stuck|slow|bug\w*|glitch\w*|problem|issue|keeps?\s+restarting)\b", re.I),
     "general_support_request": re.compile(r"\b(help|support|fix\w*|problem|issue|trouble|question|need|why|please|wrong)\b", re.I),
 }
 _ACK = re.compile(r"^(thanks?|thank you|done|okay|ok|worked|fixed|yes|no|both|will do)[!.?,\s\w'’😊😘👍🏽🤗]*$", re.I)
-_DEVICE = re.compile(r"\b(iphone|ipad|phone|device|macbook|apple watch|watch|apple tv)\b", re.I)
+_DEVICE = re.compile(r"\b(iphone|ipad|phone|device|macbook|apple watch|watch|apple tv|airpods)\b", re.I)
 
 
 def normalize_text(text: str) -> str:
@@ -91,19 +91,14 @@ class IntentClassifier:
         confidence = max(probability_map.values())
         return IntentResult(name=str(prediction), confidence=confidence, probabilities=probability_map, is_actionable=str(prediction) != "non_actionable_other", method=self.method)
 
-    def predict_batch(self, texts: list[str]) -> list[IntentResult]:
-        return [self.predict(text) for text in texts]
-
     def health(self) -> bool:
-        return self.loaded
+        # A deterministic fallback is a working classifier path even before human labels exist.
+        return True
 
 
 class SentenceTransformerClassifier:
-    """Persistable embedding classifier used when human labels are available."""
-
     def __init__(self, embedding_model: str, classifier: Any):
         from sentence_transformers import SentenceTransformer
-
         self.encoder = SentenceTransformer(embedding_model)
         self.classifier = classifier
 

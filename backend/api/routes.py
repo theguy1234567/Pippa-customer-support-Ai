@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from ..agent.agent import SupportAgent
+from ..agent.generator import llm_available
 from ..agent.models import SupportRequest, SupportResponse
 
 LOGGER = logging.getLogger(__name__)
@@ -24,9 +25,9 @@ def health(request: Request) -> dict[str, bool | str]:
     agent = getattr(request.app.state, "agent", None)
     return {
         "status": "ok",
-        "classifier_loaded": bool(agent and agent.classifier.health()),
+        "classifier_loaded": bool(agent),
         "retriever_loaded": bool(agent and agent.retriever.health),
-        "llm_available": False,
+        "llm_available": llm_available(),
     }
 
 

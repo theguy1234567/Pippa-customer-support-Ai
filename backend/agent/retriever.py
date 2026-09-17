@@ -17,15 +17,19 @@ STOP = {
     "not", "no", "im", "ive", "you", "your", "we", "us", "help", "support", "issue", "problem",
 }
 DOMAIN_TERMS = {
-    "wifi": {"wifi", "wi-fi", "wireless", "network", "router", "internet", "connect", "connection", "disconnect", "connected", "online", "offline"},
-    "bluetooth": {"bluetooth", "airpods", "headphones", "earbuds", "pair", "pairing", "disconnect"},
+    "wifi": {"wifi", "wi-fi", "wireless", "network", "router", "internet", "connect", "connecting", "connection", "disconnect", "disconnected", "connected", "online", "offline"},
+    "bluetooth": {"bluetooth", "airpods", "headphones", "earbuds", "pair", "pairing", "disconnect", "disconnected"},
     "power": {"battery", "charge", "charging", "charger", "power", "drain", "draining"},
     "screen": {"screen", "display", "touch", "touchscreen", "unresponsive"},
-    "keyboard": {"keyboard", "typing", "type", "autocorrect", "key", "keys", "letter", "symbol", "text"},
+    "keyboard": {"keyboard", "typing", "typed", "type", "autocorrect", "key", "keys", "letter", "symbol", "text"},
     "app_store": {"app", "apps", "appstore", "store", "download", "install", "purchase"},
     "safari": {"safari", "browser", "webpage", "website"},
     "update": {"update", "updating", "upgrade", "upgrading", "firmware", "ios"},
     "apple_service": {"icloud", "appleid", "music", "facetime", "imessage", "itunes", "pay"},
+}
+SYNONYMS = {
+    "connecting": "connect", "connected": "connect", "connection": "connect", "disconnecting": "disconnect", "disconnected": "disconnect",
+    "charging": "charge", "charged": "charge", "draining": "drain", "typing": "type", "typed": "type", "updating": "update", "upgraded": "upgrade",
 }
 GENERIC_PATTERNS = (
     r"\bdm us\b", r"\bwe'?re here to help\b", r"\bwe want to help\b",
@@ -35,12 +39,13 @@ GENERIC_PATTERNS = (
 
 def _tokens(text: str) -> set[str]:
     text = text.lower().replace("wi-fi", "wifi")
-    return {t for t in re.findall(r"[a-z0-9']+", text) if len(t) > 2 and t not in STOP}
+    raw = {t for t in re.findall(r"[a-z0-9']+", text) if len(t) > 2 and t not in STOP}
+    return {SYNONYMS.get(t, t) for t in raw}
 
 
 def _domains(text: str) -> set[str]:
     tokens = _tokens(text)
-    return {domain for domain, terms in DOMAIN_TERMS.items() if tokens & terms}
+    return {domain for domain, terms in DOMAIN_TERMS.items() if tokens & {SYNONYMS.get(t, t) for t in terms}}
 
 
 def _generic(text: str) -> bool:
@@ -83,15 +88,9 @@ class HistoricalRetriever:
                     if not support:
                         continue
                     self.records.append({
-                        "tweet_id": str(message["tweet_id"]),
-                        "conversation_id": str(case["case_id"]),
-                        "case_id": str(case["case_id"]),
-                        "role": "customer",
-                        "text": message["text"],
-                        "created_at": message.get("timestamp"),
-                        "support_response": support["text"],
-                        "support_tweet_id": str(support["tweet_id"]),
-                        "source": "twcs",
+                        "tweet_id": str(message["tweet_id"]), "conversation_id": str(case["case_id"]), "case_id": str(case["case_id"]),
+                        "role": "customer", "text": message["text"], "created_at": message.get("timestamp"),
+                        "support_response": support["text"], "support_tweet_id": str(support["tweet_id"]), "source": "twcs",
                     })
 
     @property
@@ -109,10 +108,7 @@ class HistoricalRetriever:
             order = sorted(range(len(self.records)), key=lambda i: (float(sims[i]), self.records[i]["tweet_id"]), reverse=True)[:limit]
             return [(float(sims[i]), self.records[i]) for i in order]
         q = _tokens(query)
-        scored = []
-        for record in self.records:
-            score = _overlap(q, _tokens(record["text"]))
-            scored.append((score, record))
+        scored = [(_overlap(q, _tokens(record["text"])), record) for record in self.records]
         return sorted(scored, key=lambda x: (x[0], x[1]["tweet_id"]), reverse=True)[:limit]
 
     def retrieve(self, query: str, top_k: int = 5, exclude_tweet_id: str | None = None) -> list[EvidenceItem]:
@@ -120,7 +116,7 @@ class HistoricalRetriever:
             raise ValueError("query must not be empty")
         q_tokens = _tokens(query)
         q_domains = _domains(query)
-        candidate_count = min(len(self.records), max(160, top_k * 40))
+        candidate_count = min(len(self.records), max(300, top_k * 60))
         candidates = self._semantic_candidates(query, candidate_count)
         ranked: list[tuple[float, dict[str, Any]]] = []
         seen_cases: set[str] = set()
@@ -142,31 +138,38 @@ class HistoricalRetriever:
             response_domain_match = 1.0 if not q_domains or not r_domains or (q_domains & r_domains) else 0.0
             generic = _generic(response)
 
-            # Strongly prefer cases that match the actual problem domain.
+            # A query domain must be present in the historical customer case. This prevents
+            # semantically similar but operationally unrelated replies from leaking through.
             if q_domains and not (q_domains & c_domains):
                 continue
             if q_domains and r_domains and not (q_domains & r_domains):
                 continue
-            if generic and q_domains and not (q_domains & r_domains):
-                continue
             if generic and "dm us" in response.lower():
+                continue
+            if generic and q_domains and not (q_domains & r_domains):
                 continue
 
             score = (
-                0.45 * max(0.0, semantic)
+                0.42 * max(0.0, semantic)
                 + 0.25 * c_overlap
-                + 0.10 * r_overlap
+                + 0.13 * r_overlap
                 + 0.15 * domain_match
                 + 0.05 * response_domain_match
             )
             if q_domains and domain_match > 0:
-                score += 0.08
-            if not q_domains and c_overlap >= 0.25:
-                score += 0.04
+                score += 0.10
+            elif not q_domains and c_overlap >= 0.25:
+                score += 0.05
+            if generic:
+                score -= 0.08
 
-            # Require either strong lexical/domain agreement or a strong TF-IDF hit.
-            acceptable = (q_domains and domain_match > 0 and (c_overlap >= 0.12 or semantic >= 0.22)) or (not q_domains and (c_overlap >= 0.22 or semantic >= 0.28))
-            if not acceptable or score < 0.22:
+            # Domain matches need only modest lexical overlap because short customer messages
+            # such as "internet not working" are common in support data.
+            acceptable = (
+                (q_domains and domain_match > 0 and (c_overlap >= 0.08 or semantic >= 0.12))
+                or (not q_domains and (c_overlap >= 0.20 or semantic >= 0.24))
+            )
+            if not acceptable or score < 0.18:
                 continue
             if record["conversation_id"] in seen_cases:
                 continue
@@ -175,16 +178,8 @@ class HistoricalRetriever:
 
         ranked.sort(key=lambda x: (x[0], x[1]["tweet_id"]), reverse=True)
         return [EvidenceItem(
-            case_id=record["case_id"],
-            tweet_id=record["tweet_id"],
-            conversation_id=record["conversation_id"],
-            role="customer",
-            timestamp=record.get("created_at"),
-            similarity=max(-1.0, min(1.0, float(score))),
-            customer_message=record["text"],
-            support_response=response,
-            resolution=None,
-            source="twcs",
-            relevance_score=float(score),
-            accepted=True,
+            case_id=record["case_id"], tweet_id=record["tweet_id"], conversation_id=record["conversation_id"], role="customer",
+            timestamp=record.get("created_at"), similarity=max(-1.0, min(1.0, float(score))),
+            customer_message=record["text"], support_response=record.get("support_response", ""), resolution=None,
+            source="twcs", relevance_score=float(score), accepted=True,
         ) for score, record in ranked[:top_k]]

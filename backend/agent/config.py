@@ -18,6 +18,8 @@ class Settings:
     top_k_retrieval: int = int(os.getenv("TOP_K_RETRIEVAL", "5"))
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "")
+    hf_token: str = os.getenv("HF_TOKEN", "")
+    hf_model: str = os.getenv("HF_MODEL", "Qwen/Qwen2.5-3B-Instruct")
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "")
     cases_path: Path = ROOT / "data" / "processed" / "apple_cases.jsonl"

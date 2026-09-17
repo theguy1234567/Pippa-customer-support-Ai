@@ -131,6 +131,7 @@ def generate_response(current_message: str, contextual_query: str, intent: str, 
     if not evidence:
         return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": [], "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "No sufficiently relevant historical evidence was found."}
     errors: list[str] = []
+    configured = bool(settings.hf_token or settings.ollama_model or settings.llm_api_key)
     for method, call in (("huggingface_qwen", _call_huggingface), ("ollama_grounded", _call_ollama), ("llm", _call_openai_compatible)):
         try:
             answer = call(current_message, contextual_query, intent, evidence)
@@ -138,7 +139,9 @@ def generate_response(current_message: str, contextual_query: str, intent: str, 
                 return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": method, "error": None}
         except Exception as error:
             errors.append(f"{method} unavailable: {type(error).__name__}: {error}")
+    if configured:
+        return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "; ".join(errors) or "Configured LLM did not return a usable answer."}
     answer = _retrieval_fallback(evidence)
     if answer:
-        return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "retrieval_fallback", "error": "; ".join(errors) or "No LLM available; used strongest grounded historical response."}
-    return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "; ".join(errors) or "No usable grounded response exists."}
+        return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "retrieval_fallback", "error": "No LLM configured; used strongest grounded historical response."}
+    return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "No usable grounded response exists."}

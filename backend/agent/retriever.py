@@ -146,9 +146,13 @@ class HistoricalRetriever:
             overlap = len(q_tokens & _meaningful_tokens(record["text"])) / max(1, len(q_tokens))
             keyword_score = _keyword_relevance(query, record["text"], response)
             domain_score, rejection = _domain_compatibility(query, record["text"], response)
-            if _generic_response(response) and (overlap < 0.25 or domain_score <= 0):
-                rejection = rejection or "generic historical support response is not sufficiently specific"
-            # Prefer exact problem vocabulary over generic TF-IDF similarity.
+            if _generic_response(response):
+                if "dm us" in response.lower():
+                    rejection = "generic DM response is not a substantive historical answer"
+                elif q_domains and not _domains(response):
+                    rejection = "generic response has no matching problem-domain evidence"
+                elif overlap < 0.25 or domain_score <= 0:
+                    rejection = rejection or "generic historical support response is not sufficiently specific"
             final_score = 0.40 * max(0.0, semantic) + 0.35 * keyword_score + 0.25 * domain_score
             if q_domains and domain_score > 0:
                 final_score += 0.15

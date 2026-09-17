@@ -134,42 +134,36 @@ class HistoricalRetriever:
             r_overlap = _overlap(q_tokens, r_tokens)
             c_domains = _domains(customer)
             r_domains = _domains(response)
-            domain_match = len(q_domains & c_domains) / max(1, len(q_domains)) if q_domains else 0.5
+            domain_match = len(q_domains & c_domains) / max(1, len(q_domains)) if q_domains else 0.0
             response_domain_match = 1.0 if not q_domains or not r_domains or (q_domains & r_domains) else 0.0
             generic = _generic(response)
 
-            # A query domain must be present in the historical customer case. This prevents
-            # semantically similar but operationally unrelated replies from leaking through.
+            # A named problem domain must be represented by the historical customer case.
             if q_domains and not (q_domains & c_domains):
                 continue
             if q_domains and r_domains and not (q_domains & r_domains):
                 continue
             if generic and "dm us" in response.lower():
                 continue
-            if generic and q_domains and not (q_domains & r_domains):
+
+            # Do not let a high TF-IDF score from a single generic word bypass topical relevance.
+            if q_domains:
+                acceptable = domain_match > 0 and (c_overlap >= 0.12 or semantic >= 0.16)
+            else:
+                acceptable = c_overlap >= 0.22 or semantic >= 0.26
+            if not acceptable:
                 continue
 
             score = (
-                0.42 * max(0.0, semantic)
-                + 0.25 * c_overlap
-                + 0.13 * r_overlap
-                + 0.15 * domain_match
+                0.45 * max(0.0, semantic)
+                + 0.30 * c_overlap
+                + 0.10 * r_overlap
+                + 0.10 * domain_match
                 + 0.05 * response_domain_match
             )
-            if q_domains and domain_match > 0:
-                score += 0.10
-            elif not q_domains and c_overlap >= 0.25:
-                score += 0.05
             if generic:
-                score -= 0.08
-
-            # Domain matches need only modest lexical overlap because short customer messages
-            # such as "internet not working" are common in support data.
-            acceptable = (
-                (q_domains and domain_match > 0 and (c_overlap >= 0.08 or semantic >= 0.12))
-                or (not q_domains and (c_overlap >= 0.20 or semantic >= 0.24))
-            )
-            if not acceptable or score < 0.18:
+                score -= 0.10
+            if score < 0.16:
                 continue
             if record["conversation_id"] in seen_cases:
                 continue

@@ -1,10 +1,11 @@
-"""End-to-end support-agent orchestration."""
+"""End-to-end support-agent orchestration with conversation-aware grounding."""
 
 from __future__ import annotations
 
 import logging
 
 from .classifier import IntentClassifier
+from .conversation import build_contextual_query
 from .escalation import decide
 from .generator import generate_response
 from .models import SupportRequest, SupportResponse
@@ -19,17 +20,23 @@ class SupportAgent:
         self.retriever = retriever or HistoricalRetriever()
 
     def run(self, request: SupportRequest) -> SupportResponse:
-        LOGGER.info("support request received")
-        intent = self.classifier.predict(request.message)
-        LOGGER.info("intent prediction: %s", intent.name)
-        evidence = self.retriever.retrieve(request.message, top_k=5)
-        LOGGER.info("retrieval completed: %d evidence items", len(evidence))
-        generated = generate_response(request.message, intent.name, intent.confidence, evidence, False)
-        decision = decide(intent, evidence, generated["grounded"])
-        if decision.action == "HUMAN_ESCALATION" and generated["grounded"]:
-            generated = generate_response(request.message, intent.name, intent.confidence, evidence, True)
-        LOGGER.info("escalation decision: %s", decision.action)
-        LOGGER.info("generation completed: %s", generated["generation_method"])
+        contextual_query = build_contextual_query(request.message, request.conversation)
+        intent = self.classifier.predict(contextual_query)
+        evidence = self.retriever.retrieve(contextual_query, top_k=10)
+        generated = generate_response(
+            current_message=request.message,
+            contextual_query=contextual_query,
+            intent=intent.name,
+            confidence=intent.confidence,
+            evidence=evidence,
+        )
+        decision = decide(intent, generated["evidence"], generated["grounded"])
+
+        # Customer-facing safety contract: escalations never leak historical replies.
+        if decision.action == "HUMAN_ESCALATION" or not generated["grounded"]:
+            generated["reply"] = generated["safe_reply"]
+            generated["grounded"] = False
+
         return SupportResponse(
             message=request.message,
             intent=intent,
@@ -41,8 +48,9 @@ class SupportAgent:
             grounded=generated["grounded"],
             retrieval_method=self.retriever.method,
             generation_method=generated["generation_method"],
+            context_query=contextual_query,
         )
 
 
-def run_agent(message: str, agent: SupportAgent | None = None) -> SupportResponse:
-    return (agent or SupportAgent()).run(SupportRequest(message=message))
+def run_agent(message: str, conversation=None, agent: SupportAgent | None = None) -> SupportResponse:
+    return (agent or SupportAgent()).run(SupportRequest(message=message, conversation=conversation or []))

@@ -11,13 +11,13 @@ from typing import Any
 from .config import settings
 from .models import EvidenceItem
 
-GENERIC = {"apple", "iphone", "ipad", "phone", "device", "ios", "issue", "problem", "help", "please", "support", "work", "working", "thing", "things", "one", "just", "really", "need", "want"}
+GENERIC = {"apple", "iphone", "ipad", "phone", "device", "ios", "issue", "problem", "help", "please", "support", "work", "working", "thing", "things", "one", "just", "really", "need", "want", "my"}
 DOMAIN_TERMS = {
-    "wifi": {"wifi", "wi-fi", "wireless", "network", "router", "internet", "connect", "connection", "disconnect"},
+    "wifi": {"wifi", "wi-fi", "wireless", "network", "router", "internet", "connect", "connection", "disconnect", "connected"},
     "bluetooth": {"bluetooth", "airpods", "headphones", "earbuds", "pair", "pairing", "disconnect"},
     "power": {"battery", "charge", "charging", "charger", "power", "drain", "draining"},
     "screen": {"screen", "display", "touch", "touchscreen", "unresponsive"},
-    "keyboard": {"keyboard", "typing", "type", "autocorrect", "key", "keys"},
+    "keyboard": {"keyboard", "typing", "type", "autocorrect", "key", "keys", "letter", "symbol"},
     "app_store": {"app", "apps", "appstore", "store", "download", "install", "purchase"},
     "safari": {"safari", "browser", "webpage", "website"},
     "update": {"update", "updating", "upgrade", "upgrading", "firmware", "ios"},
@@ -55,6 +55,17 @@ def _domain_compatibility(query: str, customer: str, response: str) -> tuple[flo
     if r_domains and not (r_domains & q_domains):
         return 0.0, "historical support response addresses a different domain"
     return min(1.0, 0.55 + 0.2 * len(q_domains & c_domains)), None
+
+
+def _keyword_relevance(query: str, customer: str, response: str) -> float:
+    q_tokens = _meaningful_tokens(query)
+    if not q_tokens:
+        return 0.0
+    c_tokens = _meaningful_tokens(customer)
+    r_tokens = _meaningful_tokens(response)
+    customer_overlap = len(q_tokens & c_tokens) / len(q_tokens)
+    response_overlap = len(q_tokens & r_tokens) / len(q_tokens)
+    return min(1.0, 0.75 * customer_overlap + 0.25 * response_overlap)
 
 
 class HistoricalRetriever:
@@ -104,7 +115,7 @@ class HistoricalRetriever:
     def retrieve(self, query: str, top_k: int = 5, exclude_tweet_id: str | None = None) -> list[EvidenceItem]:
         if not query or not query.strip():
             raise ValueError("query must not be empty")
-        candidate_count = max(40, top_k * 8)
+        candidate_count = min(len(self.records), max(80, top_k * 12))
         if self.loaded and self.vectorizer is not None and self.index is not None:
             query_vector = self.vectorizer.transform([query])
             similarities = (self.index @ query_vector.T).toarray().ravel()
@@ -125,6 +136,7 @@ class HistoricalRetriever:
         q_tokens = _meaningful_tokens(query)
         accepted: list[tuple[float, dict[str, Any]]] = []
         seen_cases: set[str] = set()
+        q_domains = _domains(query)
         for semantic, record in candidates:
             if record["tweet_id"] == exclude_tweet_id or record["conversation_id"] in seen_cases:
                 continue
@@ -132,13 +144,17 @@ class HistoricalRetriever:
             if not response:
                 continue
             overlap = len(q_tokens & _meaningful_tokens(record["text"])) / max(1, len(q_tokens))
+            keyword_score = _keyword_relevance(query, record["text"], response)
             domain_score, rejection = _domain_compatibility(query, record["text"], response)
-            if _generic_response(response) and (overlap < 0.35 or domain_score <= 0):
+            if _generic_response(response) and (overlap < 0.25 or domain_score <= 0):
                 rejection = rejection or "generic historical support response is not sufficiently specific"
-            final_score = 0.55 * max(0.0, semantic) + 0.25 * overlap + 0.20 * domain_score
-            if rejection or domain_score <= 0 or final_score < 0.34:
+            # Prefer exact problem vocabulary over generic TF-IDF similarity.
+            final_score = 0.40 * max(0.0, semantic) + 0.35 * keyword_score + 0.25 * domain_score
+            if q_domains and domain_score > 0:
+                final_score += 0.15
+            if rejection or domain_score <= 0 or final_score < 0.30:
                 continue
-            accepted.append((final_score, record))
+            accepted.append((min(1.0, final_score), record))
             seen_cases.add(record["conversation_id"])
 
         accepted.sort(key=lambda x: (x[0], x[1]["tweet_id"]), reverse=True)

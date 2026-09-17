@@ -1,4 +1,4 @@
-"""Grounded response generation using a free local Ollama model when available."""
+"""Grounded response generation using an optional local LLM."""
 
 from __future__ import annotations
 
@@ -30,8 +30,15 @@ def llm_available() -> bool:
 def _clean(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _retrieval_fallback(evidence: list[EvidenceItem]) -> str | None:
+    """Return the strongest accepted historical reply when no LLM is configured."""
+    if not evidence:
+        return None
+    answer = _clean(evidence[0].support_response)
+    return answer or None
 
 
 def _call_ollama(current_message: str, contextual_query: str, intent: str, evidence: list[EvidenceItem]) -> str | None:
@@ -88,18 +95,20 @@ def _call_openai_compatible(current_message: str, contextual_query: str, intent:
 def generate_response(current_message: str, contextual_query: str, intent: str, confidence: float, evidence: list[EvidenceItem]) -> dict:
     if not evidence:
         return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": [], "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "No sufficiently relevant historical evidence was found."}
+    llm_error = None
     try:
         answer = _call_ollama(current_message, contextual_query, intent, evidence)
         if answer:
             return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "ollama_grounded", "error": None}
     except Exception as error:
         llm_error = f"Local LLM unavailable; deterministic fallback used: {type(error).__name__}"
-    else:
-        llm_error = None
     try:
         answer = _call_openai_compatible(current_message, contextual_query, intent, evidence)
         if answer:
             return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "llm", "error": None}
     except Exception as error:
-        llm_error = f"LLM generation failed; safe fallback used: {type(error).__name__}"
-    return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": llm_error or "No local LLM is available."}
+        llm_error = f"LLM generation failed; deterministic fallback used: {type(error).__name__}"
+    answer = _retrieval_fallback(evidence)
+    if answer:
+        return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "retrieval_fallback", "error": llm_error or "No LLM is available; used the strongest grounded historical response."}
+    return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": llm_error or "No usable grounded response exists."}

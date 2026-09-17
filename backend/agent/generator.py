@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import settings
 from .models import EvidenceItem
 
 SAFE_ESCALATION = "I’m not confident I have enough information from the available support history to give you a reliable answer. This should be reviewed by a support specialist."
+HF_DEFAULT_PROVIDER = "featherless-ai"
 
 
 def _ollama_model() -> str | None:
@@ -59,12 +61,19 @@ def _prompt(current_message: str, contextual_query: str, intent: str, evidence: 
     return system, user
 
 
+def _hf_model_id() -> str:
+    model = settings.hf_model.strip()
+    if ":" in model:
+        return model
+    return f"{model}:{HF_DEFAULT_PROVIDER}"
+
+
 def _call_huggingface(current_message: str, contextual_query: str, intent: str, evidence: list[EvidenceItem]) -> str | None:
     if not settings.hf_token or not settings.hf_model:
         return None
     system, user = _prompt(current_message, contextual_query, intent, evidence)
     payload = json.dumps({
-        "model": settings.hf_model,
+        "model": _hf_model_id(),
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0.1,
         "max_tokens": 180,
@@ -75,8 +84,14 @@ def _call_huggingface(current_message: str, contextual_query: str, intent: str, 
         headers={"Authorization": f"Bearer {settings.hf_token}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=45) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=45) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:240]
+        raise RuntimeError(f"Hugging Face HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Hugging Face connection failed: {error.reason}") from error
     answer = str(body.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
     if not answer or "INSUFFICIENT_EVIDENCE" in answer.upper():
         return None
@@ -122,7 +137,7 @@ def generate_response(current_message: str, contextual_query: str, intent: str, 
             if answer:
                 return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": method, "error": None}
         except Exception as error:
-            errors.append(f"{method} unavailable: {type(error).__name__}")
+            errors.append(f"{method} unavailable: {type(error).__name__}: {error}")
     answer = _retrieval_fallback(evidence)
     if answer:
         return {"reply": answer, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": True, "confidence": min(1.0, max(0.0, confidence)), "generation_method": "retrieval_fallback", "error": "; ".join(errors) or "No LLM available; used strongest grounded historical response."}

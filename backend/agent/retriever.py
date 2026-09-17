@@ -1,4 +1,4 @@
-"""Historical AppleSupport retrieval with persisted artifacts and safe fallback."""
+"""Two-stage historical retrieval with generalized problem-domain reranking."""
 
 from __future__ import annotations
 
@@ -8,14 +8,53 @@ import re
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from .config import settings
 from .models import EvidenceItem
 
+GENERIC = {"apple", "iphone", "ipad", "phone", "device", "ios", "issue", "problem", "help", "please", "support", "work", "working", "thing", "things", "one", "just", "really", "need", "want"}
+DOMAIN_TERMS = {
+    "wifi": {"wifi", "wi-fi", "wireless", "network", "router", "internet", "connect", "connection", "disconnect"},
+    "bluetooth": {"bluetooth", "airpods", "headphones", "earbuds", "pair", "pairing", "disconnect"},
+    "power": {"battery", "charge", "charging", "charger", "power", "drain", "draining"},
+    "screen": {"screen", "display", "touch", "touchscreen", "unresponsive"},
+    "keyboard": {"keyboard", "typing", "type", "autocorrect", "key", "keys"},
+    "app_store": {"app", "apps", "appstore", "store", "download", "install", "purchase"},
+    "safari": {"safari", "browser", "webpage", "website"},
+    "update": {"update", "updating", "upgrade", "upgrading", "firmware", "ios"},
+    "apple_service": {"icloud", "appleid", "music", "facetime", "imessage", "itunes", "pay"},
+}
+GENERIC_REPLY_PATTERNS = (r"^we'?re here to help\b", r"^we want to help\b", r"^let'?s look into", r"\bdm us\b", r"\bwhich software version\b", r"\bwhat version\b")
+
 
 def _tokens(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9']+", text.lower()))
+    return set(re.findall(r"[a-z0-9']+", text.lower().replace("wi-fi", "wifi")))
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    return {token for token in _tokens(text) if token not in GENERIC and len(token) > 2}
+
+
+def _domains(text: str) -> set[str]:
+    tokens = _tokens(text)
+    return {domain for domain, terms in DOMAIN_TERMS.items() if tokens & terms}
+
+
+def _generic_response(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    return any(re.search(pattern, normalized, re.I) for pattern in GENERIC_REPLY_PATTERNS)
+
+
+def _domain_compatibility(query: str, customer: str, response: str) -> tuple[float, str | None]:
+    q_domains = _domains(query)
+    c_domains = _domains(customer)
+    r_domains = _domains(response)
+    if not q_domains:
+        return 0.5, None
+    if not (q_domains & c_domains):
+        return 0.0, "historical customer problem is from a different domain"
+    if r_domains and not (r_domains & q_domains):
+        return 0.0, "historical support response addresses a different domain"
+    return min(1.0, 0.55 + 0.2 * len(q_domains & c_domains)), None
 
 
 class HistoricalRetriever:
@@ -42,21 +81,16 @@ class HistoricalRetriever:
             for line in handle:
                 case = json.loads(line)
                 messages = case.get("conversation", [])
-                customer = [message for message in messages if message.get("role") == "customer"]
-                support = [message for message in messages if message.get("role") == "support"]
-                if not customer:
-                    continue
-                for message in customer:
+                for index, message in enumerate(messages):
+                    if message.get("role") != "customer":
+                        continue
+                    next_support = next((m for m in messages[index + 1:] if m.get("role") == "support"), None)
+                    if not next_support:
+                        continue
                     self.records.append({
-                        "tweet_id": str(message["tweet_id"]),
-                        "conversation_id": str(case["case_id"]),
-                        "case_id": str(case["case_id"]),
-                        "role": "customer",
-                        "text": message["text"],
-                        "created_at": message.get("timestamp"),
-                        "support_response": support[0]["text"] if support else "",
-                        "support_tweet_id": str(support[0]["tweet_id"]) if support else None,
-                        "source": "twcs",
+                        "tweet_id": str(message["tweet_id"]), "conversation_id": str(case["case_id"]), "case_id": str(case["case_id"]),
+                        "role": "customer", "text": message["text"], "created_at": message.get("timestamp"),
+                        "support_response": next_support["text"], "support_tweet_id": str(next_support["tweet_id"]), "source": "twcs",
                     })
 
     @property
@@ -65,40 +99,51 @@ class HistoricalRetriever:
 
     @property
     def method(self) -> str:
-        return "persisted_tfidf" if self.loaded else "deterministic_token_overlap"
+        return "persisted_tfidf_reranked" if self.loaded else "deterministic_reranked"
 
     def retrieve(self, query: str, top_k: int = 5, exclude_tweet_id: str | None = None) -> list[EvidenceItem]:
         if not query or not query.strip():
             raise ValueError("query must not be empty")
-        candidates = [record for record in self.records if record["tweet_id"] != exclude_tweet_id]
+        candidate_count = max(40, top_k * 8)
         if self.loaded and self.vectorizer is not None and self.index is not None:
             query_vector = self.vectorizer.transform([query])
             similarities = (self.index @ query_vector.T).toarray().ravel()
-            ranked = sorted(zip(similarities, self.records), key=lambda value: (float(value[0]), value[1]["tweet_id"]), reverse=True)
-            candidates = [(float(score), record) for score, record in ranked if record["tweet_id"] != exclude_tweet_id]
+            ranked_indices = sorted(range(len(self.records)), key=lambda i: (float(similarities[i]), self.records[i]["tweet_id"]), reverse=True)[:candidate_count]
+            candidates = [(float(similarities[i]), self.records[i]) for i in ranked_indices]
         else:
-            candidates = [(None, record) for record in candidates]
-        query_tokens = _tokens(query)
-        scored = []
-        for persisted_score, record in candidates:
-            if persisted_score is not None:
-                scored.append((persisted_score, record))
-                continue
-            overlap = query_tokens & _tokens(record["text"])
-            union = query_tokens | _tokens(record["text"])
-            score = len(overlap) / len(union) if union else 0.0
-            scored.append((score, record))
-        results: list[EvidenceItem] = []
+            query_tokens = _meaningful_tokens(query)
+            scored = []
+            for record in self.records:
+                if record["tweet_id"] == exclude_tweet_id:
+                    continue
+                tokens = _meaningful_tokens(record["text"])
+                union = query_tokens | tokens
+                score = len(query_tokens & tokens) / len(union) if union else 0.0
+                scored.append((score, record))
+            candidates = sorted(scored, key=lambda x: (x[0], x[1]["tweet_id"]), reverse=True)[:candidate_count]
+
+        q_tokens = _meaningful_tokens(query)
+        accepted: list[tuple[float, dict[str, Any]]] = []
         seen_cases: set[str] = set()
-        for score, record in sorted(scored, key=lambda value: (value[0], value[1]["tweet_id"]), reverse=True):
-            if record["conversation_id"] in seen_cases:
+        for semantic, record in candidates:
+            if record["tweet_id"] == exclude_tweet_id or record["conversation_id"] in seen_cases:
                 continue
+            response = record.get("support_response", "").strip()
+            if not response:
+                continue
+            overlap = len(q_tokens & _meaningful_tokens(record["text"])) / max(1, len(q_tokens))
+            domain_score, rejection = _domain_compatibility(query, record["text"], response)
+            if _generic_response(response) and (overlap < 0.35 or domain_score <= 0):
+                rejection = rejection or "generic historical support response is not sufficiently specific"
+            final_score = 0.55 * max(0.0, semantic) + 0.25 * overlap + 0.20 * domain_score
+            if rejection or domain_score <= 0 or final_score < 0.34:
+                continue
+            accepted.append((final_score, record))
             seen_cases.add(record["conversation_id"])
-            results.append(EvidenceItem(
-                case_id=record["case_id"], tweet_id=record["tweet_id"], conversation_id=record["conversation_id"],
-                role="customer", timestamp=record.get("created_at"), similarity=max(-1.0, min(1.0, float(score))),
-                customer_message=record["text"], support_response=record.get("support_response", ""), resolution=None, source="twcs",
-            ))
-            if len(results) >= top_k:
-                break
-        return results
+
+        accepted.sort(key=lambda x: (x[0], x[1]["tweet_id"]), reverse=True)
+        return [EvidenceItem(
+            case_id=record["case_id"], tweet_id=record["tweet_id"], conversation_id=record["conversation_id"], role="customer",
+            timestamp=record.get("created_at"), similarity=max(-1.0, min(1.0, float(score))), customer_message=record["text"],
+            support_response=record.get("support_response", ""), resolution=None, source="twcs", relevance_score=float(score), accepted=True,
+        ) for score, record in accepted[:top_k]]

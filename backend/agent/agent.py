@@ -1,4 +1,4 @@
-"""End-to-end support-agent orchestration with conversation-aware grounding."""
+"""End-to-end conversational support pipeline."""
 
 from __future__ import annotations
 
@@ -20,9 +20,12 @@ class SupportAgent:
         self.retriever = retriever or HistoricalRetriever()
 
     def run(self, request: SupportRequest) -> SupportResponse:
+        # Context resolution is deliberately separate from retrieval and generation.
+        # Only customer turns are allowed to influence the contextual query.
         contextual_query = build_contextual_query(request.message, request.conversation)
         intent = self.classifier.predict(contextual_query)
         evidence = self.retriever.retrieve(contextual_query, top_k=10)
+
         generated = generate_response(
             current_message=request.message,
             contextual_query=contextual_query,
@@ -30,24 +33,22 @@ class SupportAgent:
             confidence=intent.confidence,
             evidence=evidence,
         )
-        decision = decide(intent, generated["evidence"], generated["grounded"])
 
-        # Customer-facing safety contract: escalations never leak historical replies.
-        if decision.action == "HUMAN_ESCALATION" or not generated["grounded"]:
-            generated["reply"] = generated["safe_reply"]
-            generated["grounded"] = False
+        decision = decide(intent, generated["evidence"], generated["grounded"])
+        grounded = bool(generated["grounded"] and decision.action == "AUTO_HANDLE")
+        reply = generated["reply"] if grounded else generated["safe_reply"]
 
         return SupportResponse(
             message=request.message,
             intent=intent,
             evidence=generated["evidence"],
-            response=generated["reply"],
-            reply=generated["reply"],
+            response=reply,
+            reply=reply,
             generation_error=generated.get("error"),
             decision=decision,
-            grounded=generated["grounded"],
+            grounded=grounded,
             retrieval_method=self.retriever.method,
-            generation_method=generated["generation_method"],
+            generation_method=generated["generation_method"] if grounded else "safe_escalation",
             context_query=contextual_query,
         )
 

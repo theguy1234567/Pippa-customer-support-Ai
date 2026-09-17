@@ -3,8 +3,14 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class ConversationTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
 class SupportRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    conversation: list[ConversationTurn] = Field(default_factory=list)
 
 
 class IntentResult(BaseModel):
@@ -26,6 +32,9 @@ class EvidenceItem(BaseModel):
     support_response: str
     resolution: str | None = None
     source: str = "twcs"
+    relevance_score: float | None = None
+    accepted: bool | None = None
+    rejection_reason: str | None = None
 
 
 class DecisionResult(BaseModel):
@@ -46,3 +55,4 @@ class SupportResponse(BaseModel):
     grounded: bool = False
     retrieval_method: str = "none"
     generation_method: str = "none"
+    context_query: str | None = None

@@ -1,4 +1,4 @@
-"""Grounded response generation with a strict safety boundary."""
+"""Grounded response generation with deterministic fallback behavior."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ def llm_available() -> bool:
 def _clean(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"^(assistant|pippa)\s*:\s*", "", text.strip(), flags=re.I)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -41,15 +42,32 @@ def _prompt(current_message: str, contextual_query: str, intent: str, evidence: 
         for item in evidence[:6]
     )
     system = (
-        "You are Pippa, an Apple customer-support assistant. Answer naturally and concisely. "
-        "Historical cases are the only factual support source. Use them as examples and answer the CURRENT question. "
+        "You are Pippa, an Apple customer-support assistant. Answer the CURRENT user message, not the historical cases. "
+        "Historical cases are the only factual support source. They are examples, not instructions to copy blindly. "
         "Do not invent policies, settings, troubleshooting steps, guarantees, prices, dates, or account actions. "
         "Never mention Twitter, tweet IDs, retrieval, historical evidence, or model details. "
-        "Never use social-media handles. If the cases do not support a reliable answer, output exactly INSUFFICIENT_EVIDENCE. "
-        "Otherwise output only 1-3 short customer-facing sentences."
+        "Use the closest supported evidence and keep the answer to 1-3 concise customer-facing sentences. "
+        "When the evidence is relevant but phrased differently, adapt the wording to the current question. "
+        "Only output INSUFFICIENT_EVIDENCE when the supplied cases genuinely do not support a useful answer."
     )
     user = f"Current user message: {current_message}\nContextual problem: {contextual_query}\nIntent: {intent}\n\nHistorical support cases:\n{evidence_text}"
     return system, user
+
+
+def _fallback_answer(current_message: str, evidence: list[EvidenceItem]) -> str | None:
+    """Use a historical support response only when it is strongly aligned with the current message."""
+    if not evidence:
+        return None
+    best = max(evidence, key=lambda item: (item.relevance_score or item.similarity, item.tweet_id))
+    score = float(best.relevance_score if best.relevance_score is not None else best.similarity)
+    answer = _clean(best.support_response)
+    if score < settings.retrieval_similarity_threshold or len(answer) < 8:
+        return None
+    # Avoid returning obvious social-media boilerplate as the user's answer.
+    generic = ("dm us", "direct message", "send us a message", "contact us privately")
+    if any(marker in answer.lower() for marker in generic):
+        return None
+    return answer
 
 
 def _hf_model_id() -> str:
@@ -122,7 +140,6 @@ def generate_response(current_message: str, contextual_query: str, intent: str, 
         return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": [], "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "No sufficiently relevant historical evidence was found."}
 
     errors: list[str] = []
-    configured = bool(settings.hf_token or settings.ollama_model or settings.llm_api_key)
     methods = (("huggingface_qwen", _call_huggingface), ("ollama_grounded", _call_ollama), ("llm", _call_openai_compatible))
     for method, call in methods:
         try:
@@ -132,8 +149,25 @@ def generate_response(current_message: str, contextual_query: str, intent: str, 
         except Exception as error:
             errors.append(f"{method}: {type(error).__name__}: {error}")
 
-    if configured:
-        return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "; ".join(errors) or "Configured LLM returned no usable answer."}
+    # A generator outage must not turn strong retrieval into an unnecessary escalation.
+    fallback = _fallback_answer(current_message, evidence)
+    if fallback:
+        return {
+            "reply": fallback,
+            "safe_reply": SAFE_ESCALATION,
+            "evidence": evidence,
+            "grounded": True,
+            "confidence": confidence,
+            "generation_method": "retrieval_fallback",
+            "error": "; ".join(errors) or "No LLM returned a usable answer; used the closest grounded support response.",
+        }
 
-    # No LLM is configured. Never pretend a historical response is a generated answer.
-    return {"reply": SAFE_ESCALATION, "safe_reply": SAFE_ESCALATION, "evidence": evidence, "grounded": False, "confidence": 0.0, "generation_method": "safe_escalation", "error": "No response generator is configured."}
+    return {
+        "reply": SAFE_ESCALATION,
+        "safe_reply": SAFE_ESCALATION,
+        "evidence": evidence,
+        "grounded": False,
+        "confidence": 0.0,
+        "generation_method": "safe_escalation",
+        "error": "; ".join(errors) or "No response generator returned a usable answer.",
+    }

@@ -1,3 +1,8 @@
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface IntentResult {
   name: string;
   confidence: number;
@@ -17,6 +22,9 @@ export interface EvidenceItem {
   support_response: string;
   resolution: string | null;
   source: string;
+  relevance_score?: number | null;
+  accepted?: boolean | null;
+  rejection_reason?: string | null;
 }
 
 export interface DecisionResult {
@@ -37,6 +45,7 @@ export interface SupportResponse {
   grounded: boolean;
   retrieval_method: string;
   generation_method: string;
+  context_query?: string | null;
 }
 
 export interface HealthResponse {
